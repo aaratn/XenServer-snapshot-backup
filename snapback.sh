@@ -26,7 +26,6 @@ MONTHLY_ON="Sun"
 # Temporary file
 TEMP=/tmp/snapback.$$
 # UUID of the destination SR for backups
-DEST_SR=e871f2df-a195-9c50-5377-be55e749c003
 
 LOCKFILE=/tmp/snapback.lock
 
@@ -42,7 +41,7 @@ touch $LOCKFILE
 #
 
 # Date format must be %Y%m%d so we can sort them
-BACKUP_DATE=$(date +"%Y%m%d")
+BACKUP_DATE=$(date +"%Y%m%d%H%S")
 
 # Quick hack to grab the required paramater from the output of the xe command
 function xe_param()
@@ -62,11 +61,6 @@ function xe_param()
 function delete_snapshot()
 {
 	DELETE_SNAPSHOT_UUID=$1
-	for VDI_UUID in $(xe vbd-list vm-uuid=$DELETE_SNAPSHOT_UUID empty=false | xe_param "vdi-uuid"); do
-        	echo "Deleting snapshot VDI : $VDI_UUID"
-        	xe vdi-destroy uuid=$VDI_UUID
-	done
-
 	# Now we can remove the snapshot itself
 	echo "Removing snapshot with UUID : $DELETE_SNAPSHOT_UUID"
 	xe snapshot-uninstall uuid=$DELETE_SNAPSHOT_UUID force=true
@@ -137,76 +131,21 @@ for VM in $RUNNING_VMS; do
 			continue
 		fi
 	fi
-	
-	echo "= Checking snapshots for $VM_NAME ="
-	VM_SNAPSHOT_CHECK=$(xe snapshot-list name-label=$VM_NAME-$SNAPSHOT_SUFFIX | xe_param uuid)
-	if [ "$VM_SNAPSHOT_CHECK" != "" ]; then
-		echo "Found old backup snapshot : $VM_SNAPSHOT_CHECK"
-		echo "Deleting..."
-		delete_snapshot $VM_SNAPSHOT_CHECK
-	fi
-	echo "Done."
-
-	echo "= Creating snapshot backup ="
-
-	# Select appropriate snapshot command
-	# See above - not using this yet, as have to work around failures
-	#if [ "$QUIESCE" == "true" ]; then
-	#	echo "Using VSS plugin"
-	#	SNAPSHOT_CMD="vm-snapshot-with-quiesce"
-	#else
-	#	echo "Not using VSS plugin, disks will not be quiesced"
-	#	SNAPSHOT_CMD="vm-snapshot"
-	#fi
+	echo "== Backing up VM $VM =="
 	SNAPSHOT_CMD="vm-snapshot"
+        SNAPSHOT_UUID=$(xe $SNAPSHOT_CMD vm="$VM_NAME" new-name-label="$VM_NAME-$SNAPSHOT_SUFFIX-$BACKUP_DATE")
+        echo "=== Created snapshot with UUID $SNAPSHOT_UUID ==="
+        VM_NAME="$(xe vm-list uuid=$VM | xe_param name-label)"
+        echo "== Checking Snapshots for $VM_NAME =="
+        xe snapshot-list | grep "$VM_NAME-" | xe_param name-label | sort -n | head -n-$RETAIN > $TEMP
+        while read OLD_SNAPSHOT; do
+                OLD_SNAPSHOT_UUID=$(xe snapshot-list name-label="$OLD_SNAPSHOT" | xe_param uuid)
+                echo "Removing $OLD_SNAPSHOT with UUID $OLD_SNAPSHOT_UUID"
+                delete_snapshot $OLD_SNAPSHOT_UUID
 
-	SNAPSHOT_UUID=$(xe $SNAPSHOT_CMD vm="$VM_NAME" new-name-label="$VM_NAME-$SNAPSHOT_SUFFIX")
-	echo "Created snapshot with UUID : $SNAPSHOT_UUID"
-
-	echo "= Copying snapshot to SR ="
-	# Check there isn't a stale template with TEMP_SUFFIX name hanging around from a failed job
-	TEMPLATE_TEMP="$(xe template-list name-label="$VM_NAME-$TEMP_SUFFIX" | xe_param uuid)"
-	if [ "$TEMPLATE_TEMP" != "" ]; then
-		echo "Found a stale temporary template, removing UUID $TEMPLATE_TEMP"
-		delete_template $TEMPLATE_TEMP
-	fi
-	TEMPLATE_UUID=$(xe snapshot-copy uuid=$SNAPSHOT_UUID sr-uuid=$DEST_SR new-name-description="Snapshot created on $(date)" new-name-label="$VM_NAME-$TEMP_SUFFIX")
-	echo "Done."
-
-	echo "= Removing temporary snapshot backup ="
-	delete_snapshot $SNAPSHOT_UUID
-	echo "Done."
-	
-	
-	# List templates for all VMs, grep for $VM_NAME-$BACKUP_SUFFIX
-	# Sort -n, head -n -$RETAIN
-	# Loop through and remove each one
-	echo "= Removing old backups ="
-	xe template-list | grep "$VM_NAME-$BACKUP_SUFFIX" | xe_param name-label | sort -n | head -n-$RETAIN > $TEMP
-	while read OLD_TEMPLATE; do
-		OLD_TEMPLATE_UUID=$(xe template-list name-label="$OLD_TEMPLATE" | xe_param uuid)
-		echo "Removing : $OLD_TEMPLATE with UUID $OLD_TEMPLATE_UUID"
-		delete_template $OLD_TEMPLATE_UUID
-	done < $TEMP
-	
-	# Also check there is no template with the current timestamp.
-	# Otherwise, you would not be able to backup more than once a day if you needed...
-	TODAYS_TEMPLATE="$(xe template-list name-label="$VM_NAME-$BACKUP_SUFFIX-$BACKUP_DATE" | xe_param uuid)"
-	if [ "$TODAYS_TEMPLATE" != "" ]; then
-		echo "Found a template already for today, removing UUID $TODAYS_TEMPLATE"
-		delete_template $TODAYS_TEMPLATE
-	fi
-
-	echo "= Renaming template ="
-	xe template-param-set name-label="$VM_NAME-$BACKUP_SUFFIX-$BACKUP_DATE" uuid=$TEMPLATE_UUID
-	echo "Done."
-
-	echo "== Backup for $VM_NAME finished at $(date) =="
-	echo " "
+        done < $TEMP
 done
 
-xe vdi-list sr-uuid=$DEST_SR > /var/run/sr-mount/$DEST_SR/mapping.txt
-xe vbd-list > /var/run/sr-mount/$DEST_SR/vbd-mapping.txt
 
 echo "=== Snapshot backup finished at $(date) ==="
 rm $TEMP
